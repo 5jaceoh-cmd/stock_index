@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1115" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>실시간 지수</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1115; --card: #161a21; --line: #222731; --text: #e6e8eb; --sub: #8b93a1;
+      --up: #ff5a5f; --down: #4c8dff; --flat: #8b93a1;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; background: var(--bg); color: var(--text);
+      font-family: -apple-system, "Pretendard", "Noto Sans KR", "Malgun Gothic", sans-serif; }
+    header {
+      position: sticky; top: 0; z-index: 10;
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding: calc(env(safe-area-inset-top) + 12px) 16px 12px;
+      background: rgba(15, 17, 21, 0.92); backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0; font-size: 19px; font-weight: 700; }
+    #status { font-size: 11px; color: var(--sub); text-align: right; line-height: 1.45; white-space: nowrap; }
+    #status .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #3ecf8e; margin-right: 4px; vertical-align: middle; }
+    #status.err .dot { background: var(--up); }
+    main { padding: 12px 12px calc(env(safe-area-inset-bottom) + 16px); display: grid; gap: 10px; }
+    .card {
+      display: grid; grid-template-columns: 1fr auto; grid-template-rows: auto auto;
+      gap: 2px 10px; align-items: center;
+      background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+      padding: 12px 14px; color: inherit; text-decoration: none;
+      transition: background-color .6s;
+    }
+    .card.flash-up { background: rgba(255, 90, 95, .14); transition: none; }
+    .card.flash-down { background: rgba(76, 141, 255, .14); transition: none; }
+    .name { font-size: 15px; font-weight: 600; }
+    .meta { font-size: 11px; color: var(--sub); margin-top: 2px; }
+    .meta .state { padding: 1px 5px; border-radius: 4px; background: #232833; margin-left: 4px; }
+    .meta .state.open { background: rgba(62, 207, 142, .15); color: #3ecf8e; }
+    .price { font-size: 21px; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; letter-spacing: -0.3px; }
+    .chg { font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+    .up { color: var(--up); } .down { color: var(--down); } .flat { color: var(--flat); }
+    .spark { grid-column: 1 / -1; height: 46px; margin-top: 6px; }
+    .spark svg { width: 100%; height: 100%; display: block; }
+    .error { grid-column: 1 / -1; font-size: 12px; color: var(--sub); }
+    #notice { display: none; margin: 12px; padding: 12px 14px; border-radius: 12px;
+      background: #2a1d1f; border: 1px solid #4a2a2e; font-size: 13px; line-height: 1.5; }
+    footer { text-align: center; color: #5d6471; font-size: 11px; padding: 0 16px 24px; line-height: 1.6; }
+    @media (min-width: 720px) {
+      main { grid-template-columns: 1fr 1fr; max-width: 960px; margin: 0 auto; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📈 실시간 지수</h1>
+    <div id="status"><span class="dot"></span><span id="updated">불러오는 중…</span><br><span id="clock"></span></div>
+  </header>
+
+  <div id="notice"></div>
+  <main id="list"></main>
+
+  <footer>
+    데이터: Yahoo Finance (일부 종목 지연 시세 가능) · 15초마다 자동 갱신<br />
+    카드를 누르면 TradingView 차트가 열립니다 · 상승 <span class="up">빨강</span> / 하락 <span class="down">파랑</span>
+  </footer>
+
+  <script>
+    // ===== 설정 =====
+    // Cloudflare Worker 배포 후 받은 주소를 넣으세요. (예: "https://stock-proxy.내아이디.workers.dev")
+    const WORKER_URL = "https://stock-proxy.5jaceoh.workers.dev";
+    const REFRESH_MS = 15000;
+
+    const SYMBOLS = [
+      { id: "^KS11", name: "코스피",              tv: "KRX:KOSPI",     digits: 2 },
+      { id: "^IXIC", name: "나스닥 종합",          tv: "NASDAQ:IXIC",   digits: 2 },
+      { id: "^GSPC", name: "S&P 500",            tv: "SP:SPX",        digits: 2 },
+      { id: "NQ=F",  name: "나스닥100 선물 (NQ1!)", tv: "CME_MINI:NQ1!", digits: 2 },
+      { id: "SOXX",  name: "SOXX 반도체 ETF",      tv: "NASDAQ:SOXX",   digits: 2 },
+      { id: "DRAM",  name: "DRAM 메모리 ETF",      tv: "AMEX:DRAM",     digits: 2 },
+    ];
+    // ================
+
+    const API = WORKER_URL || (["localhost", "127.0.0.1"].includes(location.hostname) ? "http://localhost:8787" : "");
+    const $ = (sel, el = document) => el.querySelector(sel);
+    const lastPrice = {};
+
+    function buildCards() {
+      const list = $("#list");
+      for (const s of SYMBOLS) {
+        const a = document.createElement("a");
+        a.className = "card";
+        a.id = "c-" + s.id.replace(/[^A-Za-z0-9]/g, "_");
+        a.href = "https://www.tradingview.com/chart/?symbol=" + encodeURIComponent(s.tv);
+        a.target = "_blank"; a.rel = "noopener";
+        a.innerHTML = `
+          <div><div class="name">${s.name}</div><div class="meta">—</div></div>
+          <div><div class="price">—</div><div class="chg flat">&nbsp;</div></div>
+          <div class="spark"></div>`;
+        list.appendChild(a);
+      }
+    }
+
+    const fmt = (n, d = 2) => n == null || isNaN(n) ? "—" :
+      n.toLocaleString("ko-KR", { minimumFractionDigits: d, maximumFractionDigits: d });
+
+    function timeIn(tz, unix) {
+      return new Date(unix * 1000).toLocaleTimeString("ko-KR", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false });
+    }
+
+    function sparkline(points, prevClose, cls) {
+      if (!points || points.length < 2) return "";
+      const W = 300, H = 46, P = 3;
+      const ys = points.map((p) => p[1]).concat(prevClose ?? []);
+      const min = Math.min(...ys), max = Math.max(...ys), span = max - min || 1;
+      const t0 = points[0][0], t1 = points[points.length - 1][0], tspan = t1 - t0 || 1;
+      const X = (t) => ((t - t0) / tspan) * W;
+      const Y = (v) => P + (1 - (v - min) / span) * (H - P * 2);
+      const d = points.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join("");
+      const color = cls === "up" ? "var(--up)" : cls === "down" ? "var(--down)" : "var(--flat)";
+      const base = prevClose != null ? `<line x1="0" x2="${W}" y1="${Y(prevClose).toFixed(1)}" y2="${Y(prevClose).toFixed(1)}" stroke="#3a404c" stroke-dasharray="3 3" stroke-width="1"/>` : "";
+      return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${base}
+        <path d="${d}" fill="none" stroke="${color}" stroke-width="1.6" vector-effect="non-scaling-stroke" stroke-linejoin="round"/></svg>`;
+    }
+
+    function update(q) {
+      const s = SYMBOLS.find((x) => x.id === q.symbol);
+      const card = document.getElementById("c-" + q.symbol.replace(/[^A-Za-z0-9]/g, "_"));
+      if (!s || !card) return;
+      if (q.error) { $(".meta", card).textContent = "데이터 오류: " + q.error; return; }
+
+      const diff = q.price - q.prevClose;
+      const pct = q.prevClose ? (diff / q.prevClose) * 100 : 0;
+      const cls = diff > 0 ? "up" : diff < 0 ? "down" : "flat";
+      const arrow = diff > 0 ? "▲" : diff < 0 ? "▼" : "";
+
+      $(".price", card).textContent = fmt(q.price, s.digits);
+      const chg = $(".chg", card);
+      chg.className = "chg " + cls;
+      chg.textContent = `${arrow} ${fmt(Math.abs(diff), s.digits)} (${pct > 0 ? "+" : ""}${pct.toFixed(2)}%)`;
+
+      const now = Date.now() / 1000;
+      const tp = q.tradingPeriod;
+      const open = tp && now >= tp.start && now < tp.end;
+      $(".meta", card).innerHTML = `${timeIn("Asia/Seoul", q.time)} 기준<span class="state ${open ? "open" : ""}">${open ? "장중" : "장마감"}</span>`;
+      $(".spark", card).innerHTML = sparkline(q.points, q.prevClose, cls);
+
+      const prev = lastPrice[q.symbol];
+      if (prev != null && prev !== q.price) {
+        card.classList.add(q.price > prev ? "flash-up" : "flash-down");
+        setTimeout(() => card.classList.remove("flash-up", "flash-down"), 50);
+      }
+      lastPrice[q.symbol] = q.price;
+    }
+
+    let timer = null;
+    async function load() {
+      clearTimeout(timer);
+      const status = $("#status");
+      try {
+        const res = await fetch(`${API}/?symbols=${encodeURIComponent(SYMBOLS.map((s) => s.id).join(","))}`, { cache: "no-store" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        data.quotes.forEach(update);
+        status.classList.remove("err");
+        $("#updated").textContent = "갱신 " + new Date().toLocaleTimeString("en-GB", { hour12: false });
+      } catch (e) {
+        status.classList.add("err");
+        $("#updated").textContent = "연결 실패 · 재시도 중";
+      }
+      if (!document.hidden) timer = setTimeout(load, REFRESH_MS);
+    }
+
+    function tick() {
+      const now = Date.now() / 1000;
+      $("#clock").textContent = `서울 ${timeIn("Asia/Seoul", now)} · 뉴욕 ${timeIn("America/New_York", now)}`;
+    }
+
+    buildCards();
+    tick(); setInterval(tick, 10000);
+
+    if (!API) {
+      const n = $("#notice");
+      n.style.display = "block";
+      n.innerHTML = "⚙️ 데이터 서버(WORKER_URL)가 설정되지 않았습니다.<br>README의 Cloudflare Worker 설정 방법을 따라 index.html의 <code>WORKER_URL</code>을 채워주세요.";
+    } else {
+      load();
+      // 앱 전환 후 돌아오면 즉시 갱신, 백그라운드에선 멈춤
+      document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); else clearTimeout(timer); });
+    }
+  </script>
+</body>
+</html>
